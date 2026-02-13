@@ -626,7 +626,7 @@ def apply_moe_ep_tp(
             else:
                 # input / output sharding on the batch / tokens dim
                 try:
-                    from torchtitan_xpu import get_expert_parallel_class
+                    from torchtitan.distributed import get_expert_parallel_class
 
                     ep_class = get_expert_parallel_class()
                     experts_plan = ep_class()
