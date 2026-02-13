@@ -12,6 +12,35 @@ from dataclasses import dataclass
 from typing import Generator, Optional
 
 import torch
+try:
+    import intel_extension_for_pytorch as ipex  # noqa: F401
+    import torch.xpu
+except ImportError:
+    ipex = None
+
+# Hack to avoids broken triton backend (amd/nvidia) discovery on Intel systems
+try:
+    import importlib.metadata as metadata
+    orig_entry_points = metadata.entry_points
+    
+    def filtered_entry_points(*args, **kwargs):
+        eps = orig_entry_points(*args, **kwargs)
+        if hasattr(eps, 'select'):
+             class FilteredEPs:
+                 def select(self, **f_kwargs):
+                     results = eps.select(**f_kwargs)
+                     if f_kwargs.get('group') == 'triton.backends':
+                         return [ep for ep in results if ep.name not in ['amd', 'nvidia']]
+                     return results
+                 def __getitem__(self, key): return eps[key]
+                 def __iter__(self): return iter(eps)
+             return FilteredEPs()
+        return eps
+
+    metadata.entry_points = filtered_entry_points
+except Exception:
+    pass
+
 from torch._utils import _get_available_device_type, _get_device_module
 
 from torchtitan.tools.logging import logger

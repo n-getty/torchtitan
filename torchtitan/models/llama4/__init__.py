@@ -34,6 +34,85 @@ llama4_args = {
         vocab_size=2048,
         rope_theta=500000,
         rope_scaling_args=RoPEScalingArgs(),
+        moe_args=MoEArgs(num_experts=8),
+    ),
+    "debugmodel_dense": TransformerModelArgs(
+        dim=256,
+        n_layers=6,
+        n_heads=16,
+        rope_theta=500000,
+    ),
+    "debugmodel_12_rank": TransformerModelArgs(
+        dim=384,
+        n_layers=6,
+        n_heads=12,
+        vocab_size=2048,
+        rope_theta=500000,
+        rope_scaling_args=RoPEScalingArgs(),
+        moe_args=MoEArgs(num_experts=12),
+    ),
+    "debugmodel_dense_12_rank": TransformerModelArgs(
+        dim=384,
+        n_layers=6,
+        n_heads=12,
+        vocab_size=2048,
+        rope_theta=500000,
+        interleave_moe_layer_step=100,
+    ),
+    # Medium-sized models for realistic benchmarks (~30-40 GiB per rank)
+    "mediummodel_12_rank": TransformerModelArgs(
+        dim=2304,  # Divisible by 12 for FSDP sharding
+        n_layers=24,
+        n_heads=24,
+        n_kv_heads=8,
+        vocab_size=32000,
+        rope_theta=500000,
+        rope_scaling_args=RoPEScalingArgs(),
+        moe_args=MoEArgs(num_experts=12),
+        interleave_moe_layer_step=2,  # MoE every 2 layers
+    ),
+    "mediummodel_dense_12_rank": TransformerModelArgs(
+        dim=2304,
+        n_layers=24,
+        n_heads=24,
+        n_kv_heads=8,
+        vocab_size=32000,
+        rope_theta=500000,
+        interleave_moe_layer_step=100,  # Effectively disable MoE
+    ),
+    # Large models for high-memory benchmarks (~50 GiB per rank)
+    "largemodel_12_rank": TransformerModelArgs(
+        dim=4608,  # Divisible by 12 for FSDP sharding
+        n_layers=32,
+        n_heads=36,
+        n_kv_heads=12,
+        vocab_size=32000,
+        rope_theta=500000,
+        rope_scaling_args=RoPEScalingArgs(),
+        moe_args=MoEArgs(num_experts=12),
+        interleave_moe_layer_step=2,  # MoE every 2 layers
+    ),
+    "largemodel_dense_12_rank": TransformerModelArgs(
+        dim=4608,
+        n_layers=32,
+        n_heads=36,
+        n_kv_heads=12,
+        vocab_size=32000,
+        rope_theta=500000,
+        interleave_moe_layer_step=100,  # Effectively disable MoE
+    ),
+    # Dense model with equivalent TOTAL parameters to the MoE version
+    # MoE has 16 dense layers + 16 MoE layers (12 experts) = 16 + 192 = 208 FFN units
+    # Dense needs 32 layers * X = 208 => X = 6.5x larger FFN
+    "largemodel_dense_equivalent": TransformerModelArgs(
+        dim=4608,
+        n_layers=32,
+        n_heads=36,
+        n_kv_heads=12,
+        vocab_size=32000,
+        rope_theta=500000,
+        ffn_dim_multiplier=6.5,  # 6.5x larger FFN to match parameter count
+        interleave_moe_layer_step=100,  # Disable MoE
     ),
     "17bx16e": TransformerModelArgs(
         dim=5120,
@@ -98,6 +177,57 @@ llama4_args = {
         every_n_layers_nope=4,
         attn_type="flex",
         attn_mask_type="block_causal",
+    ),
+    "3B_12_rank": TransformerModelArgs(
+        dim=3072,  # Divisible by 12 for FSDP sharding
+        n_layers=28,
+        n_heads=24,
+        n_kv_heads=8,
+        vocab_size=128256,
+        rope_theta=500000,
+        rope_scaling_args=RoPEScalingArgs(),
+        moe_args=MoEArgs(num_experts=12),
+        interleave_moe_layer_step=2,
+    ),
+    "3B_dense_12_rank": TransformerModelArgs(
+        dim=3072,
+        n_layers=28,
+        n_heads=24,
+        n_kv_heads=8,
+        vocab_size=128256,
+        rope_theta=500000,
+        interleave_moe_layer_step=100,  # Effectively disable MoE
+    ),
+    "1B_12_rank": TransformerModelArgs(
+        dim=2048,
+        n_layers=16,
+        n_heads=32,
+        n_kv_heads=8,
+        vocab_size=128256,
+        rope_theta=500000,
+        rope_scaling_args=RoPEScalingArgs(),
+        moe_args=MoEArgs(num_experts=12),
+        interleave_moe_layer_step=2,
+    ),
+    "1B_dense_12_rank": TransformerModelArgs(
+        dim=2048,
+        n_layers=16,
+        n_heads=32,
+        n_kv_heads=8,
+        vocab_size=128256,
+        rope_theta=500000,
+        interleave_moe_layer_step=100,  # Effectively disable MoE
+    ),
+    "3B_total_12_rank": TransformerModelArgs(
+        dim=1536,
+        n_layers=34,
+        n_heads=24,
+        n_kv_heads=8,
+        vocab_size=128256,
+        rope_theta=500000,
+        rope_scaling_args=RoPEScalingArgs(),
+        moe_args=MoEArgs(num_experts=12),
+        interleave_moe_layer_step=2,
     ),
 }
 

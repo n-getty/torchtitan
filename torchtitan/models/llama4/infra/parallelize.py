@@ -7,6 +7,7 @@
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointWrapper,
@@ -14,6 +15,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
 from torch.distributed.tensor import Partial, Replicate, Shard
+
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     parallelize_module,
@@ -44,7 +46,10 @@ from torchtitan.models.moe import moe as moe_module
 from torchtitan.tools.logging import logger
 
 # for selective op activation checkpointing
-_op_sac_save_list = {
+# NOTE: all_to_all_single is excluded when EP is enabled to avoid memory leaks.
+# The EP communication tensors are large and saving them causes memory growth.
+# They will be recomputed during backward pass instead.
+_op_sac_save_list_base = {
     torch.ops.aten.mm.default,
     torch.ops.aten._scaled_dot_product_efficient_attention.default,
     torch.ops.aten._scaled_dot_product_flash_attention.default,
@@ -52,14 +57,15 @@ _op_sac_save_list = {
     torch.ops.aten._scaled_dot_product_attention_math.default,
     torch.ops.aten._scaled_dot_product_fused_attention_overrideable.default,
     torch.ops._c10d_functional.reduce_scatter_tensor.default,
-    torch.ops._c10d_functional.all_to_all_single.default,
     # for low precision training, it's useful to always save
     # the result of max, since the absolute maximum is
     # used to compute the scaling factor for quantization.
     torch.ops.aten.max.default,
     torch._higher_order_ops.flex_attention,
-    torch._higher_order_ops.inductor_compiled_code,
 }
+
+# all_to_all_single is only included when EP is NOT enabled
+_op_sac_save_list = _op_sac_save_list_base.copy()
 
 
 def parallelize_llama(
@@ -77,9 +83,7 @@ def parallelize_llama(
     # TODO: TP currently cannot handle uneven seq_len because we set
     #       `use_local_output=True` to use plain Tensors for legacy reasons.
     #       Need to revisit this.
-    assert (
-        job_config.training.seq_len % parallel_dims.seq_len_divisor == 0
-    ), f"""
+    assert job_config.training.seq_len % parallel_dims.seq_len_divisor == 0, f"""
         Sequence length {job_config.training.seq_len} must be divisible by the product of TP degree
         ({parallel_dims.tp}) and 2 * CP degree ({parallel_dims.cp}).
         """
@@ -133,12 +137,9 @@ def parallelize_llama(
     if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
         dual_pipe_v = get_dual_pipe_v_flag(job_config, parallel_dims)
 
-        # tp_mesh might have been set above if tp_enabled, otherwise get it here
-        if tp_mesh is None:
-            tp_mesh = parallel_dims.get_mesh("tp")
         apply_moe_ep_tp(
             model,
-            tp_mesh=tp_mesh,
+            tp_mesh=parallel_dims.get_optional_mesh("tp"),
             ep_mesh=parallel_dims.get_optional_mesh("ep"),
             etp_mesh=parallel_dims.get_optional_mesh("etp"),
             ep_etp_mesh=parallel_dims.get_optional_mesh(["ep", "etp"]),
@@ -150,17 +151,29 @@ def parallelize_llama(
         job_config.compile.enable and "model" in job_config.compile.components
     )
     if job_config.activation_checkpoint.mode != "none":
+        # Build the save list for selective AC
+        # When EP is enabled, exclude all_to_all_single to prevent memory leaks
+        # The EP communication tensors are large and saving them causes memory growth
+        op_sac_save_list = _op_sac_save_list_base.copy()
+        if not parallel_dims.ep_enabled:
+            # Only save all_to_all outputs when EP is NOT enabled
+            op_sac_save_list.add(torch.ops._c10d_functional.all_to_all_single.default)
+        else:
+            logger.info(
+                "EP enabled: excluding all_to_all_single from AC save list to prevent memory leaks"
+            )
+
         if job_config.activation_checkpoint.selective_ac_option == "op":
             logger.info(
-                f"SAC save list contains {len(_op_sac_save_list)} ops: "
-                f"{sorted([str(op) for op in _op_sac_save_list])}"
+                f"SAC save list contains {len(op_sac_save_list)} ops: "
+                f"{sorted([str(op) for op in op_sac_save_list])}"
             )
         apply_ac(
             model,
             job_config.activation_checkpoint,
             model_compile_enabled=model_compile_enabled,
             # pyrefly: ignore [bad-argument-type]
-            op_sac_save_list=_op_sac_save_list,
+            op_sac_save_list=op_sac_save_list,
             base_folder=job_config.job.dump_folder,
         )
 
@@ -201,15 +214,13 @@ def parallelize_llama(
         else:
             logger.info("Applied FSDP to the model")
 
-        if parallel_dims.cp_enabled:
-            logger.info("Applied Context Parallel to the model")
-
         if job_config.training.enable_cpu_offload:
             logger.info("Applied CPU Offloading to the model")
+
     elif parallel_dims.dp_replicate_enabled:
         dp_mesh = parallel_dims.get_mesh("dp_replicate")
-        if parallel_dims.world_size != dp_mesh.size():
-            raise RuntimeError("DDP has not supported > 1D parallelism")
+        # if parallel_dims.world_size != dp_mesh.size():
+        #     raise RuntimeError("DDP has not supported > 1D parallelism")
         apply_ddp(
             model,
             dp_mesh,
@@ -343,7 +354,47 @@ def apply_fsdp(
             - "never" will disable `reshard_after_forward` for all forward passes.
 
     """
+    # XPU/XCCL compatibility: Force sum-type reductions to avoid PREMUL_SUM
+    # which is not supported by Intel's XCCL backend
+    try:
+        from torch.distributed.fsdp import set_force_sum_reduction_for_comms
+
+        set_force_sum_reduction_for_comms(True)
+    except ImportError:
+        # API doesn't exist in this PyTorch version (e.g. 0.2.1), use monkey-patch instead
+        import torch.distributed.fsdp._fully_shard._fsdp_collectives as fsdp_collectives
+
+        # Patch _get_gradient_divide_factors to always force sum reduction
+        if hasattr(fsdp_collectives, "_get_gradient_divide_factors") and not hasattr(
+            fsdp_collectives, "_orig_get_gradient_divide_factors"
+        ):
+            fsdp_collectives._orig_get_gradient_divide_factors = (
+                fsdp_collectives._get_gradient_divide_factors
+            )
+
+            def _patched_get_gradient_divide_factors(*args, **kwargs):
+                # Force force_sum_reduction_for_comms=True to avoid PREMUL_SUM
+                # It is the 6th argument (index 5) in the function signature
+                if len(args) >= 6:
+                    args = list(args)
+                    args[5] = True
+                    args = tuple(args)
+                else:
+                    kwargs["force_sum_reduction_for_comms"] = True
+                return fsdp_collectives._orig_get_gradient_divide_factors(
+                    *args, **kwargs
+                )
+
+            fsdp_collectives._get_gradient_divide_factors = (
+                _patched_get_gradient_divide_factors
+            )
+            print(
+                "[FSDP XPU FIX] Monkey-patched _get_gradient_divide_factors to force sum reduction",
+                flush=True,
+            )
+
     mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
+
     fsdp_config: dict[str, Any] = {"mesh": dp_mesh, "mp_policy": mp_policy}
     if cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy()
@@ -388,10 +439,13 @@ def apply_fsdp(
             _experts_shard_placement_fn = None
             assert edp_mesh is not None
             assert hasattr(transformer_block, "moe")
-            if (
-                edp_mesh["efsdp"].size() * ep_degree
-                > transformer_block.moe.experts.num_experts
-            ):
+            # Workaround for "Cannot create a submesh from a submesh" error
+            efsdp_size = 1
+            if "efsdp" in edp_mesh.mesh_dim_names:
+                efsdp_idx = edp_mesh.mesh_dim_names.index("efsdp")
+                efsdp_size = edp_mesh.size(efsdp_idx)
+
+            if efsdp_size * ep_degree > transformer_block.moe.experts.num_experts:
                 _experts_shard_placement_fn = lambda param: Shard(1)
 
             fully_shard(
@@ -571,7 +625,17 @@ def apply_moe_ep_tp(
                 logger.info("Applying DeepEP to MoE layer")
             else:
                 # input / output sharding on the batch / tokens dim
-                experts_plan = ExpertParallel()
+                try:
+                    from torchtitan_xpu import get_expert_parallel_class
+
+                    ep_class = get_expert_parallel_class()
+                    experts_plan = ep_class()
+                    logger.info(f"Using EP class: {ep_class.__name__}")
+                except ImportError as e:
+                    logger.warning(
+                        f"torchtitan_xpu import failed: {e}, falling back to native ExpertParallel"
+                    )
+                    experts_plan = ExpertParallel()
         else:
             experts_mesh = ep_etp_mesh
             experts_plan = ExpertTensorParallel()
@@ -596,8 +660,10 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig, ep_enabled: b
     # but it is experimental.
     torch._dynamo.config.capture_scalar_outputs = True
     # Workaround for https://github.com/pytorch/pytorch/issues/166926
-    # pyrefly: ignore [missing-attribute]
-    torch._C._dynamo.eval_frame._set_lru_cache(False)
+    # This API is only available in PyTorch 2.9+, optional for 2.8
+    if hasattr(torch._C._dynamo.eval_frame, "_set_lru_cache"):
+        # pyrefly: ignore [missing-attribute]
+        torch._C._dynamo.eval_frame._set_lru_cache(False)
     # pyrefly: ignore [missing-attribute]
     for layer_id, transformer_block in model.layers.named_children():
         if transformer_block.moe_enabled:

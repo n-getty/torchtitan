@@ -20,19 +20,31 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 from torch.distributed.checkpoint import HuggingFaceStorageWriter
-from torch.distributed.checkpoint._consolidate_hf_safetensors import (
-    consolidate_safetensors_files_on_every_rank,
-)
-from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
+try:
+    from torch.distributed.checkpoint._consolidate_hf_safetensors import (
+        consolidate_safetensors_files_on_every_rank,
+    )
+except ImportError:
+    consolidate_safetensors_files_on_every_rank = None
+try:
+    from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
+except ImportError:
+    DefaultStager = None
+    StagingOptions = None
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
     set_model_state_dict,
     StateDictOptions,
 )
-from torch.distributed.checkpoint.state_dict_saver import (
-    AsyncCheckpointerType,
-    AsyncSaveResponse,
-)
+try:
+    from torch.distributed.checkpoint.state_dict_saver import (
+        AsyncCheckpointerType,
+        AsyncSaveResponse,
+    )
+except ImportError:
+    class AsyncCheckpointerType:
+        PROCESS = "process"
+    AsyncSaveResponse = Any
 from torch.distributed.checkpoint.stateful import Stateful
 
 from torchtitan.components.dataloader import BaseDataLoader
@@ -426,13 +438,19 @@ class CheckpointManager:
 
         # pyrefly: ignore [missing-attribute]
         if to_hf and self.sd_adapter.fqn_to_index_mapping:
-            consolidate_safetensors_files_on_every_rank(
-                input_dir=os.path.join(checkpoint_id, "sharded"),
-                output_dir=checkpoint_id,
-                # pyrefly: ignore [bad-argument-type]
-                fqn_to_index_mapping=self.sd_adapter.fqn_to_index_mapping,
-                num_threads=5,
-            )
+            if consolidate_safetensors_files_on_every_rank is not None:
+                consolidate_safetensors_files_on_every_rank(
+                    input_dir=os.path.join(checkpoint_id, "sharded"),
+                    output_dir=checkpoint_id,
+                    # pyrefly: ignore [bad-argument-type]
+                    fqn_to_index_mapping=self.sd_adapter.fqn_to_index_mapping,
+                    num_threads=5,
+                )
+            else:
+                logger.warning(
+                    "consolidate_safetensors_files_on_every_rank is not available. "
+                    "Skipping consolidation of safetensors files."
+                )
 
         if enable_garbage_collection:
             GarbageCollection.collect("GC collection invoked by checkpointer.")

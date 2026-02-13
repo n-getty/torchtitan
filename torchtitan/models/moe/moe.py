@@ -36,6 +36,8 @@ class MoEArgs:
 
     _debug_force_load_balance: bool = False
     # if True, we force each experts get same amount of token via round-robin
+    
+    use_triton_moe: bool = False
 
 
 # can be used as dense FFN layer or shared experts in MoE layers
@@ -134,6 +136,7 @@ class GroupedExperts(nn.Module):
         hidden_dim: int,
         num_experts: int,
         use_grouped_mm: bool,
+        use_triton_moe: bool = False,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -141,6 +144,7 @@ class GroupedExperts(nn.Module):
         self.w2 = nn.Parameter(torch.empty(num_experts, dim, hidden_dim))
         self.w3 = nn.Parameter(torch.empty(num_experts, hidden_dim, dim))
         self.use_grouped_mm = use_grouped_mm
+        self.use_triton_moe = use_triton_moe
 
     def forward(
         self,
@@ -156,9 +160,30 @@ class GroupedExperts(nn.Module):
             # pyrefly: ignore [missing-attribute]
             w3 = self.w3.to_local()
         else:
-            w1 = self.w1
-            w2 = self.w2
-            w3 = self.w3
+            w1 = self.experts.w1 if hasattr(self, "experts") else self.w1
+            w2 = self.experts.w2 if hasattr(self, "experts") else self.w2
+            w3 = self.experts.w3 if hasattr(self, "experts") else self.w3
+
+
+        if self.use_triton_moe:
+            from .triton_fused_moe_xpu import fused_moe
+            # w1, w2, w3 are [Experts, Hidden, Dim] or [Experts, Dim, Hidden]
+            # triton_fused_moe expects [Experts, Model, Inter]
+            # GroupedExperts layout: w1[E, H, D], w2[E, D, H], w3[E, H, D]
+            # So transpose them appropriately.
+            w1_t = w1.transpose(1, 2)
+            w2_t = w2.transpose(1, 2)
+            w3_t = w3.transpose(1, 2)
+            
+            # Construct topk_ids for the sorted tokens arriving from dispatch
+            # or from the reorderer. num_tokens_per_expert is local tokens count.
+            device = x.device
+            num_local_experts = num_tokens_per_expert.shape[0]
+            expert_ids = torch.arange(num_local_experts, device=device)
+            topk_ids = torch.repeat_interleave(expert_ids, num_tokens_per_expert.to(torch.int32)).unsqueeze(1)
+            topk_weights = torch.ones((x.shape[0], 1), device=device, dtype=x.dtype)
+            
+            return fused_moe(x, w1_t, w2_t, w3_t, topk_weights, topk_ids, inplace=False)
 
         if self.use_grouped_mm:
             # NOTE: If EP is not used, we need to pad the indices
@@ -423,6 +448,7 @@ class MoE(nn.Module):
             hidden_dim=hidden_dim,
             num_experts=num_experts,
             use_grouped_mm=moe_args.use_grouped_mm,
+            use_triton_moe=moe_args.use_triton_moe,
         )
         self.router = TokenChoiceTopKRouter(
             dim=dim,
@@ -442,6 +468,7 @@ class MoE(nn.Module):
             else None
         )
         self.score_before_experts = moe_args.score_before_experts
+        self.use_triton_moe = moe_args.use_triton_moe
 
         # define fields for auxiliary-loss-free load balancing (https://arxiv.org/abs/2408.15664)
         # NOTE: tokens_per_expert is accumulated in the model forward pass.
@@ -532,6 +559,7 @@ class MoE(nn.Module):
         routed_output_unsorted = routed_output_unsorted.reshape(
             -1, self.router.top_k, dim
         )
+
         if not self.score_before_experts:
             out_experts = (
                 torch.bmm(
@@ -543,6 +571,8 @@ class MoE(nn.Module):
             )
         else:
             out_experts = routed_output_unsorted.sum(dim=1)
+
+
 
         if out is None:
             return out_experts.reshape(bs, slen, dim)

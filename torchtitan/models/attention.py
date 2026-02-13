@@ -19,7 +19,10 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
 )
 
-from torch.nn.attention.varlen import varlen_attn
+try:
+    from torch.nn.attention.varlen import varlen_attn
+except ImportError:
+    varlen_attn = None
 from torch.types import Number
 
 
@@ -48,42 +51,49 @@ class VarlenMetadata(NamedTuple):
     max_k: Number
 
 
-class VarlenAttentionWrapper(torch.nn.Module):
-    _compiled_varlen_attn: ClassVar[Callable] = torch.compile(
-        varlen_attn, mode="max-autotune-no-cudagraphs"
-    )
-
-    def forward(
-        self,
-        xq: torch.Tensor,
-        xk: torch.Tensor,
-        xv: torch.Tensor,
-        head_dim: torch.Tensor,
-        attention_masks: VarlenMetadata,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        cu_seq_q = attention_masks.cu_seq_q
-        cu_seq_k = attention_masks.cu_seq_k
-        max_q = attention_masks.max_q
-        max_k = attention_masks.max_k
-
-        n_local_heads = xq.shape[1]
-        # pyrefly: ignore [no-matching-overload]
-        xq_packed = xq.transpose(1, 2).reshape(-1, n_local_heads, head_dim)
-        # pyrefly: ignore [no-matching-overload]
-        xk_packed = xk.transpose(1, 2).reshape(-1, n_local_heads, head_dim)
-        # pyrefly: ignore [no-matching-overload]
-        xv_packed = xv.transpose(1, 2).reshape(-1, n_local_heads, head_dim)
-
-        return VarlenAttentionWrapper._compiled_varlen_attn(
-            xq_packed,
-            xk_packed,
-            xv_packed,
-            cu_seq_q,
-            cu_seq_k,
-            max_q,
-            max_k,
-            is_causal=True,
+if varlen_attn is not None:
+    class VarlenAttentionWrapper(torch.nn.Module):
+        _compiled_varlen_attn: ClassVar[Callable] = torch.compile(
+            varlen_attn, mode="max-autotune-no-cudagraphs"
         )
+
+        def forward(
+            self,
+            xq: torch.Tensor,
+            xk: torch.Tensor,
+            xv: torch.Tensor,
+            head_dim: torch.Tensor,
+            attention_masks: VarlenMetadata,
+            scale: float | None = None,
+        ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+            cu_seq_q = attention_masks.cu_seq_q
+            cu_seq_k = attention_masks.cu_seq_k
+            max_q = attention_masks.max_q
+            max_k = attention_masks.max_k
+
+            n_local_heads = xq.shape[1]
+            # pyrefly: ignore [no-matching-overload]
+            xq_packed = xq.transpose(1, 2).reshape(-1, n_local_heads, head_dim)
+            # pyrefly: ignore [no-matching-overload]
+            xk_packed = xk.transpose(1, 2).reshape(-1, n_local_heads, head_dim)
+            # pyrefly: ignore [no-matching-overload]
+            xv_packed = xv.transpose(1, 2).reshape(-1, n_local_heads, head_dim)
+
+            return VarlenAttentionWrapper._compiled_varlen_attn(
+                xq_packed,
+                xk_packed,
+                xv_packed,
+                cu_seq_q,
+                cu_seq_k,
+                max_q,
+                max_k,
+                is_causal=True,
+                scale=scale,
+            )
+else:
+    class VarlenAttentionWrapper(torch.nn.Module):
+        def forward(self, *args, **kwargs):
+            raise NotImplementedError("Varlen attention is not available.")
 
 
 class FlexAttentionWrapper(torch.nn.Module):
@@ -103,7 +113,6 @@ class FlexAttentionWrapper(torch.nn.Module):
         flex_attention,
         # This options also encapsulate max-autotune-no-cudagraphs.
         options={
-            "wrap_inductor_compiled_regions": True,
             "max_autotune": True,
             "coordinate_descent_tuning": True,
             "triton.cudagraphs": False,

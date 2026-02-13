@@ -29,20 +29,19 @@ from torchtitan.models.moe.utils import _permute, _unpermute
 
 class BaseExpertParallel(ParallelStyle, ABC):
     @abstractmethod
-    def _partition_fn(self, name: str, mod: nn.Module, device_mesh: DeviceMesh) -> None:
-        ...
+    def _partition_fn(
+        self, name: str, mod: nn.Module, device_mesh: DeviceMesh
+    ) -> None: ...
 
     @abstractmethod
     def _token_dispatch(
         self, mod: nn.Module, inputs: tuple, device_mesh: DeviceMesh
-    ) -> tuple[Tensor, Tensor]:
-        ...
+    ) -> tuple[Tensor, Tensor]: ...
 
     @abstractmethod
     def _token_combine(
         self, mod: nn.Module, routed_output: Tensor, device_mesh: DeviceMesh
-    ) -> Tensor:
-        ...
+    ) -> Tensor: ...
 
 
 # implementation of Tensor Parallel for the GroupedExperts in MoE
@@ -172,10 +171,18 @@ class ExpertParallel(BaseExpertParallel):
             routed_output, self.input_shape, self.permuted_indices
         )
 
+        # Reverse the dispatch all_to_all:
+        # In dispatch: all_to_all(input, output_splits, input_splits)
+        #   - Sent input_splits[i] tokens TO rank i
+        #   - Received output_splits[i] tokens FROM rank i
+        # In combine: we need to reverse this
+        #   - Send output_splits[i] tokens TO rank i (what we received from them)
+        #   - Receive input_splits[i] tokens FROM rank i (what we sent to them)
+        # So the call is: all_to_all(output, input_splits, output_splits)
         routed_output = all_to_all_single_autograd(
             routed_output,
-            self.input_splits,
-            self.output_splits,
+            self.input_splits,  # receive partitions: what we originally sent
+            self.output_splits,  # send partitions: what we currently have (received in dispatch)
             device_mesh.get_group(),
         )
         return routed_output

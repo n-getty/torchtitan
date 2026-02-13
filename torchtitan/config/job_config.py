@@ -129,6 +129,9 @@ class Model:
     converters have been applied.
     """
 
+    use_triton_moe: bool = False
+    """Whether to use custom Triton fused MoE kernel (XPU only)"""
+
 
 @dataclass
 class Optimizer:

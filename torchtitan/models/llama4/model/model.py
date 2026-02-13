@@ -426,6 +426,7 @@ class TransformerBlock(nn.Module):
         freqs_cis: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
+        **kwargs,
     ):
         """
         Perform a forward pass through the TransformerBlock.

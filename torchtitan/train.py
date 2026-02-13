@@ -13,6 +13,7 @@ from datetime import timedelta
 from typing import Any, Iterable
 
 import torch
+import torch.distributed as dist
 import torch.distributed.checkpoint.stateful
 from torch.distributed.elastic.multiprocessing.errors import record
 
@@ -108,12 +109,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # Set random seed, and maybe enable deterministic mode
         # (mainly for debugging, expect perf loss).
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0:
+            print(f"Distributed backend: {dist.get_backend()}")
+        print(f"Rank {rank} calling set_determinism")
         dist_utils.set_determinism(
             parallel_dims,
             self.device,
             job_config.debug,
             distinct_seed_mesh_dims=["pp"],
         )
+        print(f"Rank {rank} finished set_determinism")
         self.train_spec = train_spec_module.get_train_spec(job_config.model.name)
 
         # build tokenizer and dataloader
@@ -140,11 +146,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"Building {job_config.model.name} {job_config.model.flavor}"
             f"with {json.dumps(dataclasses.asdict(model_args), indent=2, ensure_ascii=False)}"
         )
+        print(f"Rank {rank} building model on meta device")
         with (
             torch.device("meta"),
             utils.set_default_dtype(TORCH_DTYPE_MAP[job_config.training.dtype]),
         ):
             model = self.train_spec.model_cls(model_args)
+        print(f"Rank {rank} finished building model on meta device")
 
         # Build the collection of model converters. No-op if `model.converters` empty
         model_converters = build_model_converters(job_config, parallel_dims)

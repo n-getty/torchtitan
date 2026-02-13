@@ -84,9 +84,18 @@ def dist_mean(
     mesh: DeviceMesh | None = None,
     extra_pg: dist.ProcessGroup | None = None,
 ) -> float:
-    return _dist_reduce(
-        x, reduceOp=c10d.ReduceOp.AVG.name, mesh=mesh, extra_pg=extra_pg
+    # XCCL doesn't support AVG reduce operation.
+    # Implement as SUM followed by division by world size.
+    world_size = 1
+    if extra_pg is not None:
+        world_size *= extra_pg.size()
+    if mesh is not None:
+        world_size *= mesh.size()
+
+    sum_result = _dist_reduce(
+        x, reduceOp=c10d.ReduceOp.SUM.name, mesh=mesh, extra_pg=extra_pg
     )
+    return sum_result / world_size
 
 
 def set_determinism(
@@ -142,12 +151,10 @@ def set_determinism(
     # to ensure we can control which ranks have same or different seeds, all ranks agree on a starting seed.
     # if user provides one, we use this. Otherwise rank 0 rolls the dice and everyone else uses that.
     if seed is None:
-        # Extract the seed for torch's main generator on rank 0 and standardizes on using that to build
-        # seeds for unique SPMD groups
-        seed_tensor = torch.get_rng_state()[:8].to(device)
-        torch.distributed.broadcast(seed_tensor, src=0)
-        seed = seed_tensor.to("cpu").view(torch.uint64).item()
-    assert isinstance(seed, int)
+        # WORKAROUND: xccl broadcast hangs on XPU, use hardcoded seed instead
+        print(f"Rank {dist.get_rank()} using hardcoded seed (bypass xccl broadcast)")
+        seed = 42  # Hardcoded deterministic seed for all ranks
+    print(f"Rank {dist.get_rank()} seed: {seed}")
 
     # Set distinct seed for each rank in mesh dimensions, with dimension names provided by `distinct_seed_mesh_dims`
     # For PP + SPMD cases, we want to separate the world into the SPMD mesh and the PP mesh,
@@ -354,11 +361,24 @@ def init_distributed(
         os.makedirs(dump_dir, exist_ok=True)
         _warn_overwrite_env(TRACE_FILE, f"{dump_dir}/{prefix}")
 
-    torch.distributed.init_process_group(
-        backend=_get_distributed_backend(enable_cpu_backend),
-        timeout=timedelta(seconds=comm_config.init_timeout_seconds),
-        _ranks=ranks if ranks is not None else [],
-    )
+    # Skip initialization if already done (e.g., by MPI wrapper)
+    if torch.distributed.is_initialized():
+        logger.info(
+            "torch.distributed already initialized, skipping init_process_group"
+        )
+        return torch.distributed.get_world_size()
+
+    try:
+        torch.distributed.init_process_group(
+            backend=_get_distributed_backend(enable_cpu_backend),
+            timeout=timedelta(seconds=comm_config.init_timeout_seconds),
+            _ranks=ranks if ranks is not None else [],
+        )
+    except TypeError:
+        torch.distributed.init_process_group(
+            backend=_get_distributed_backend(enable_cpu_backend),
+            timeout=timedelta(seconds=comm_config.init_timeout_seconds),
+        )
 
     return torch.distributed.get_world_size()
 
@@ -518,9 +538,7 @@ def _clip_grad_norm_with_ep(
     if math.isinf(norm_type):
         total_norm = torch.maximum(ep_grads_total_norm, non_ep_grads_total_norm)
     else:
-        total_norm = (
-            ep_grads_total_norm**norm_type + non_ep_grads_total_norm**norm_type
-        )
+        total_norm = ep_grads_total_norm**norm_type + non_ep_grads_total_norm**norm_type
         total_norm **= 1.0 / norm_type
 
     if pp_mesh is not None:

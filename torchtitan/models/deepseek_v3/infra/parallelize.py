@@ -43,8 +43,11 @@ _op_sac_save_list = {
     # used to compute the scaling factor for quantization.
     torch.ops.aten.max.default,
     torch._higher_order_ops.flex_attention,
-    torch._higher_order_ops.inductor_compiled_code,
 }
+
+# Add inductor_compiled_code only if it exists (PyTorch version compatibility)
+if hasattr(torch._higher_order_ops, 'inductor_compiled_code'):
+    AC_NO_RECOMPUTE_OPS.add(torch._higher_order_ops.inductor_compiled_code)
 
 
 # Adapted from llama4/infra/parallelize.py

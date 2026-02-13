@@ -75,6 +75,30 @@ deepseekv3_args = {
         attn_type="flex",
         attn_mask_type="block_causal",
     ),
+    # 1B baseline model adapted for 12-rank EP (60 experts divisible by 12)
+    "baseline_model_1b_12rank": DeepSeekV3ModelArgs(
+        vocab_size=50304,  # for pythia tokenizer
+        dim=1024,
+        inter_dim=1024 * 4,
+        moe_inter_dim=768,
+        n_layers=10,
+        n_dense_layers=1,
+        n_heads=8,
+        moe_args=MoEArgs(
+            num_experts=60,  # Changed from 64 to 60 (divisible by 12)
+            num_shared_experts=2,
+            top_k=6,
+            score_func="sigmoid",
+            route_norm=False,
+            score_before_experts=False,
+        ),
+        q_lora_rank=0,
+        kv_lora_rank=512,
+        qk_nope_head_dim=64,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        mscale=0.70,
+    ),
     "16B": DeepSeekV3ModelArgs(
         vocab_size=102400,
         dim=2048,
@@ -100,6 +124,32 @@ deepseekv3_args = {
         attn_type="flex",
         attn_mask_type="block_causal",
     ),
+    # 16B model adapted for 12-rank EP (60 experts divisible by 12)
+    "16B_12rank": DeepSeekV3ModelArgs(
+        vocab_size=102400,
+        dim=2048,
+        inter_dim=10944,
+        moe_inter_dim=1408,
+        n_layers=27,
+        n_dense_layers=1,
+        n_heads=16,
+        moe_args=MoEArgs(
+            num_experts=60,  # Changed from 64 to 60 for EP=12 compatibility
+            num_shared_experts=2,
+            top_k=6,
+            score_func="softmax",
+            route_norm=False,
+            score_before_experts=False,
+        ),
+        q_lora_rank=0,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        mscale=0.70,
+        # attn_type and attn_mask_type omitted - defaults to SDPA for XPU
+    ),
+
     "236B": DeepSeekV3ModelArgs(
         vocab_size=102400,
         dim=5120,

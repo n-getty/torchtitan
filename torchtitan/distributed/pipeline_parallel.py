@@ -14,16 +14,28 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.pipelining import PipelineStage
 
-from torch.distributed.pipelining.schedules import (
-    _PipelineSchedule,
-    _PipelineScheduleRuntime,
-    get_schedule_class,
-    OVERLAP_F_B,
-    PipelineScheduleMulti,
-    PipelineScheduleSingle,
-    ScheduleDualPipeV,
-    ScheduleZBVZeroBubble,
-)
+try:
+    from torch.distributed.pipelining.schedules import (
+        _PipelineSchedule,
+        _PipelineScheduleRuntime,
+        get_schedule_class,
+        OVERLAP_F_B,
+        PipelineScheduleMulti,
+        PipelineScheduleSingle,
+        ScheduleDualPipeV,
+        ScheduleZBVZeroBubble,
+    )
+except ImportError:
+    from torch.distributed.pipelining.schedules import (
+        _PipelineSchedule,
+        _PipelineScheduleRuntime,
+        get_schedule_class,
+        PipelineScheduleMulti,
+        PipelineScheduleSingle,
+    )
+    OVERLAP_F_B = object()
+    class ScheduleDualPipeV: pass
+    class ScheduleZBVZeroBubble: pass
 
 from torchtitan.components.loss import LossFunction, rescale_accumulated_loss
 from torchtitan.config import JobConfig

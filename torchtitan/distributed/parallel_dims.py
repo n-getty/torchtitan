@@ -116,13 +116,9 @@ class ParallelDims:
             Uses fake backend for dimensions with degree 1 or for 'batch' dimension
             to avoid unnecessary process group creation.
             """
-            backend_override = {}
-            for name, degree in zip(dim_names, dim_degrees, strict=True):
-                if (not self._mesh_exist(name, degree)) or name == "batch":
-                    backend_override[name] = "fake"
-
-            return world_mesh._unflatten(
-                0, dim_degrees, dim_names, backend_override=backend_override
+            # Fallback to init_device_mesh as _unflatten is missing
+            return init_device_mesh(
+                device_type, dim_degrees, mesh_dim_names=dim_names
             )
 
         logger.info(
@@ -149,10 +145,17 @@ class ParallelDims:
             ("pp", "dp_replicate", "fsdp", "tp"),
             (self.pp, self.dp_replicate, fsdp, self.tp),
         )
+        if self.etp > 1:
+            sparse_dim_names = ("pp", "dp_replicate", "efsdp", "ep", "etp")
+            sparse_dim_degrees = (self.pp, self.dp_replicate, efsdp, self.ep, self.etp)
+        else:
+            sparse_dim_names = ("pp", "dp_replicate", "efsdp", "ep")
+            sparse_dim_degrees = (self.pp, self.dp_replicate, efsdp, self.ep)
+
         sparse_mesh = unflatten_mesh(
             self._world_mesh,
-            ("pp", "dp_replicate", "efsdp", "ep", "etp"),
-            (self.pp, self.dp_replicate, efsdp, self.ep, self.etp),
+            sparse_dim_names,
+            sparse_dim_degrees,
         )
 
         self._global_meshes = {
@@ -172,8 +175,10 @@ class ParallelDims:
             "tp": dataloading_mesh["tp"],
             "ep": sparse_mesh["ep"],
             "efsdp": sparse_mesh["efsdp"],
-            "etp": sparse_mesh["etp"],
+            "etp": sparse_mesh["etp"] if self.etp > 1 else None,
         }
+        # Filter out None values
+        self._meshes = {k: v for k, v in self._meshes.items() if v is not None}
 
         # Validate mesh sizes
         self._validate_meshes()
@@ -197,8 +202,9 @@ class ParallelDims:
             "tp": self.tp,
             "ep": self.ep,
             "efsdp": self.dp_shard * self.cp * self.tp // (self.etp * self.ep),
-            "etp": self.etp,
         }
+        if self.etp > 1:
+            expected_sizes["etp"] = self.etp
 
         for mesh_name, expected_size in expected_sizes.items():
             actual_size = self._meshes[mesh_name].size()
@@ -231,12 +237,18 @@ class ParallelDims:
 
         for mesh_name in dims:
             if mesh_name not in self._meshes:
+                if mesh_name == "etp" and self.etp == 1:
+                    continue
                 raise ValueError(
                     f"Invalid mesh dim: '{mesh_name}'. "
                     f"Valid dimensions are: {list(self._meshes.keys())}"
                 )
 
-        if any(not self._mesh_exist(dim, self._meshes[dim].size()) for dim in dims):
+        if any(
+            (dim == "etp" and self.etp == 1) or
+            (dim in self._meshes and not self._mesh_exist(dim, self._meshes[dim].size()))
+            for dim in dims
+        ):
             return None
 
         if len(dims) == 1:
