@@ -13,10 +13,16 @@ from torch.distributed.tensor.parallel import ParallelStyle
 from torch.distributed.tensor.placement_types import Placement
 
 from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.distributed.expert_parallel_xpu import (
+    get_expert_parallel_class,
+    XPUExpertParallel,
+)
 
 __all__ = [
     "ParallelDims",
     "NoParallel",
+    "XPUExpertParallel",
+    "get_expert_parallel_class",
 ]
 
 
